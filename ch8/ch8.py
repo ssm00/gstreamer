@@ -6,6 +6,9 @@ C tutorial ‘appsrc + tee’ 예제를 gst-python으로 옮긴 버전.
 ― 오디오 재생 / 파형 비주얼라이저 / appsink 수집 3-way 분기
 """
 import gi, math, sys, ctypes
+import numpy as np
+from gi.overrides.GstAudio import GstAudio
+
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GObject, GLib
 
@@ -49,7 +52,9 @@ class AppSrcTeeDemo:
         self.scope.set_property("style",  0)
 
         # ---------- appsrc caps 및 시그널 ----------
-        caps = Gst.Caps.from_string(f"audio/x-raw,format=S16LE,rate={SAMPLE_RATE},channels=1")
+        info = GstAudio.AudioInfo()
+        info.set_format(GstAudio.AudioFormat.S16, 44100, 1, None)
+        caps = info.to_caps()
         self.appsrc.set_property("caps", caps)
         self.appsrc.set_property("format", Gst.Format.TIME)
         self.appsrc.connect("need-data",   self.on_need_data)
@@ -115,11 +120,16 @@ class AppSrcTeeDemo:
             GLib.source_remove(self._source_id)
             del self._source_id
 
+    # 1. app sink
+    # app_sink에 데이터가 들어오면 자동으로 new-sample signal발생 여기에 데이터 수동으로 처리하는 핸들러 연결 -> emit.pull-sample은 버퍼에서 데이터를 수동으로 꺼냄
+    # 결론 : app_sink 데이터 들어오면 자동 감지 (new-sample) 발생 -> emit(pull-sample)로 수동으로 처리
+    # 2. app src
+    # appsrc의 버퍼가 비어있으면 need-data signal이 자동으로 발생 여기에 데이터를 수동으로 넣어줘야함 -> emit.push-buffer로 수동으로 데이터를 넣어줘야함
+    # 결론 : app src 버퍼가 비어있으면 자동 감지 (need-data) 발생 -> emit(push-buffer)로 수동으로 처리
     def on_new_sample(self, sink):
         sample = sink.emit("pull-sample")
         if sample:
             sys.stdout.write("*"); sys.stdout.flush()
-            sample.unref()
             return Gst.FlowReturn.OK
         return Gst.FlowReturn.ERROR
 
@@ -130,30 +140,68 @@ class AppSrcTeeDemo:
 
     # -------------------- 오디오 버퍼 push --------------------
     def push_data(self):
-        buf = Gst.Buffer.new_allocate(None, CHUNK_SIZE, None)
-        n_samples = CHUNK_SIZE // 2        # 16-bit
-        # 타임스탬프/Duration 설정
-        buf.pts = buf.dts = self.num_samples * Gst.SECOND // SAMPLE_RATE
-        buf.duration     = n_samples  * Gst.SECOND // SAMPLE_RATE
+        num_samples = CHUNK_SIZE // 2  # 2 bytes per sample (S16)
+        freq = 0.0
 
-        # waveform 생성 (C 버전과 동일 공식)
-        success, mapinfo = buf.map(Gst.MapFlags.WRITE)
+        buffer = Gst.Buffer.new_allocate(None, CHUNK_SIZE, None)
+
+        # 2. 타임스탬프 및 duration 설정
+        buffer.pts = Gst.util_uint64_scale(self.num_samples, Gst.SECOND, SAMPLE_RATE)
+        buffer.duration = Gst.util_uint64_scale(num_samples, Gst.SECOND, SAMPLE_RATE)
+
+        # 3. 버퍼 매핑하여 waveform 생성
+        success, mapinfo = buffer.map(Gst.MapFlags.WRITE)
         if not success:
+            print("Buffer map failed")
             return False
-        raw = (ctypes.c_int16 * n_samples).from_address(mapinfo.data)
+
+        raw = np.frombuffer(mapinfo.data, dtype=np.int16, count=num_samples)
+
         self.c += self.d
-        self.d -= self.c / 1000
+        self.d -= self.c / 1000.0
         freq = 1100 + 1000 * self.d
-        for i in range(n_samples):
+
+        for i in range(num_samples):
             self.a += self.b
             self.b -= self.a / freq
             raw[i] = int(500 * self.a)
-        buf.unmap(mapinfo)
 
-        self.num_samples += n_samples
-        # appsrc 로 푸시
-        ret = self.appsrc.emit("push-buffer", buf)
-        return ret == Gst.FlowReturn.OK
+        buffer.unmap(mapinfo)
+
+        # 4. 샘플 수 누적
+        self.num_samples += num_samples
+
+        # 5. appsrc로 push
+        result = self.appsrc.emit("push-buffer", buffer)
+
+        if result != Gst.FlowReturn.OK:
+            print("Push buffer failed:", result)
+            return False
+
+        return True
+
+    def fill_buffer_with_waveform(self, buffer, data, num_samples):
+        success, mapinfo = buffer.map(Gst.MapFlags.WRITE)
+        if not success:
+            print("Buffer map failed")
+            return
+
+        # numpy 배열을 통해 buffer 데이터를 직접 조작
+        raw = np.frombuffer(mapinfo.data, dtype=np.int16, count=num_samples)
+
+        # 파형 계산
+        data['c'] += data['d']
+        data['d'] -= data['c'] / 1000.0
+        freq = 1100 + 1000 * data['d']
+
+        for i in range(num_samples):
+            data['a'] += data['b']
+            data['b'] -= data['a'] / freq
+            raw[i] = int(500 * data['a'])
+
+        buffer.unmap(mapinfo)
+        data['num_samples'] += num_samples
+
 
     # -------------------- 실행 --------------------
     def run(self):
