@@ -7,16 +7,7 @@ import sys, gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
-# ---------- 공통 유틸 ----------
-def request_pad(element: Gst.Element, name_template: str) -> Gst.Pad:
-    """
-    overrides 유무에 관계없이 request pad를 얻는다.
-    """
-    if hasattr(element, "request_pad_simple"):
-        return element.request_pad_simple(name_template)
-    # overrides가 없다면 template → request_pad 사용
-    tmpl = element.get_pad_template(name_template)
-    return element.request_pad(tmpl, None, None)
+
 def link_many(*elements) -> bool:
     """C의 gst_element_link_many()와 같은 역할 (PadLinkReturn 검사)."""
     for src, sink in zip(elements, elements[1:]):
@@ -58,7 +49,6 @@ def main():
     ):
         pipeline.add(element)
     audio_source.link(tee)
-
     audio_queue.link(audio_convert)
     audio_convert.link(audio_resample)
     audio_resample.link(audio_sink)
@@ -68,9 +58,9 @@ def main():
     video_convert.link(video_sink)
 
     # 4. Tee ↔ Queue 수동 링크 (request pads)
-    tee_audio_pad = request_pad(tee, "src_%u")                    # :contentReference[oaicite:3]{index=3}
+    tee_audio_pad = Gst.Element.request_pad_simple(tee, "src_%u")
     print(f"Request pad {tee_audio_pad.get_name()} for audio")
-    tee_video_pad = request_pad(tee, "src_%u")
+    tee_video_pad = Gst.Element.request_pad_simple(tee, "src_%u")
     print(f"Request pad {tee_video_pad.get_name()} for video")
 
     queue_audio_pad = audio_queue.get_static_pad("sink")
@@ -105,10 +95,7 @@ def main():
     # 7. 정리
     tee.release_request_pad(tee_audio_pad)
     tee.release_request_pad(tee_video_pad)
-    tee_audio_pad = tee_video_pad = None
-
     pipeline.set_state(Gst.State.NULL)
-    bus.unref()
 
 if __name__ == "__main__":
     main()
